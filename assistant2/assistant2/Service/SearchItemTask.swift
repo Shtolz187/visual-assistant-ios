@@ -18,42 +18,50 @@ extension Point {
     static func * (left: Point, right: Double) -> Point {
         return Point(x: left.x * right, y: left.y * right)
     }
+    static func / (left: Point, right: Double) -> Point {
+        return Point(x: left.x / right, y: left.y / right)
+    }
 }
 
-class SearchItemTask {
-    var name: String
-    var textToSpeak: String
-    var feedBackIntensity: Double
+class SearchProvider {
+    var mode: Int // 0 - search item, 1 - search text
+    var searchValue: String = ""
+    var textToSpeak: String = ""
+    var feedBackIntensity: Double = 0.0
     
-    private var health: Int // to prevent trigger on false positive one-frame detections
-    private var smoothPosition: Point
+    private var health: Int = 0 // to prevent trigger on false positive one-frame detections
+    private var smoothPosition: Point = Point(x: -1.0, y: -1.0)
     
-    private let SCREEN_CENTER = Point(x: 0.5, y: 0.5)
+    private let SCREEN_CENTER: Point = Point(x: 0.5, y: 0.5)
+    private let CENTER_RADIUS: Double = 0.05
     private let HEALTH_MAX: Int = 10
     private let HEALTH_IN_ON_DETECT: Int = 4
     private let HEALTH_OUT_NO_DETECT: Int = 1
+    private let SMOOTH_FACTOR: Double = 0.1
     
     init() {
-        name = ""
+        mode = 0
+    }
+    
+    func reset() ->() {
+        self.searchValue = ""
         health = 0
         smoothPosition = Point(x: -1.0, y: -1.0)
         textToSpeak = ""
         feedBackIntensity = 0.0
     }
     
-    func initiateSearch(name: String) -> () {
-        self.name = name
-        health = 0
-        smoothPosition = Point(x: -1.0, y: -1.0)
-        textToSpeak = ""
-        feedBackIntensity = 0.0
+    func initiateSearch(mode: Int, searchValue: String) -> () {
+        reset()
+        self.mode = mode
+        self.searchValue = searchValue
     }
     
-    func updateConditions(recognizedObjects: [VNRecognizedObjectObservation]) -> () {
+    func processDetectionResults(recognizedObjects: [VNRecognizedObjectObservation]) -> () {
         var desiredItems = [VNRecognizedObjectObservation]()
-        for i in 0..<recognizedObjects.count {
-            let prediction = recognizedObjects[i]
-            if self.name.lowercased() == String(prediction.labels[0].identifier).lowercased() {
+        
+        for prediction in recognizedObjects {
+            if self.searchValue.lowercased() == String(prediction.labels[0].identifier).lowercased() {
                 desiredItems.append(prediction)
             }
         }
@@ -63,18 +71,50 @@ class SearchItemTask {
         }
         
         if desiredItems.count == 0 && health > 0 {
-            health -= 1
+            health -= HEALTH_OUT_NO_DETECT
         } else if desiredItems.count > 0 {
-            health += 4
+            health += HEALTH_IN_ON_DETECT
             let boundingBoxCenter = boundingBoxCenter(filterNearestToScreenCenter(desiredItems))
             
             if smoothPosition.x < 0 {
                 smoothPosition = boundingBoxCenter
             } else {
-                smoothPosition = smoothPosition * 0.5 + boundingBoxCenter * 0.5
+                smoothPosition = smoothPosition * SMOOTH_FACTOR + boundingBoxCenter * (1 - SMOOTH_FACTOR)
             }
         }
         
+        updateNotifications()
+    }
+    
+    func processDetectionResults(recognizedObjects: [VNRecognizedTextObservation]) -> () {
+        var desiredItems = [VNRecognizedTextObservation]()
+        
+        for observation in recognizedObjects {
+            guard let topCandidate = observation.topCandidates(1).first else { continue }
+            if topCandidate.string.lowercased().contains(self.searchValue.lowercased()) {
+                desiredItems.append(observation)
+            }
+        }
+        
+        if desiredItems.count == 0 && health > 0 {
+            health -= HEALTH_OUT_NO_DETECT * 2
+        } else if desiredItems.count > 0 {
+            health += HEALTH_IN_ON_DETECT
+            let boundingBoxCenter = boundingBoxCenter(filterNearestToScreenCenter(desiredItems))
+            
+            // TODO here call func to locate searched text in text block to get more precision on long strings of text
+            
+            if smoothPosition.x < 0 {
+                smoothPosition = boundingBoxCenter
+            } else {
+                smoothPosition = smoothPosition * SMOOTH_FACTOR + boundingBoxCenter * (1 - SMOOTH_FACTOR)
+            }
+        }
+        
+        updateNotifications()
+    }
+    
+    private func updateNotifications() -> () {
         if health > HEALTH_MAX {
             health = HEALTH_MAX
         } else if health < 0 {
@@ -86,37 +126,42 @@ class SearchItemTask {
         
         if smoothPosition.x > 0 && health > HEALTH_IN_ON_DETECT {
             feedBackIntensity = 0.15 + 0.85 * (1 - 2 * distancePointToPoint(pointA: smoothPosition, pointB: SCREEN_CENTER)) // < 0.15 is almost not felt
+            
             var textToSpeakX = ""
-            if smoothPosition.x < 0.45 {
+            if smoothPosition.x < 0.5 - CENTER_RADIUS {
                 textToSpeakX = "левее, ... "
-            } else if smoothPosition.x >= 0.45 && smoothPosition.x < 0.55 {
+            } else if smoothPosition.x >= 0.5 - CENTER_RADIUS && smoothPosition.x < 0.5 + CENTER_RADIUS {
                 textToSpeakX = " "
             } else {
                 textToSpeakX = "правее, ... "
             }
             
             var textToSpeakY = ""
-            if smoothPosition.y < 0.45 {
+            if smoothPosition.y < 0.5 - CENTER_RADIUS {
                 textToSpeakY = "ниже, ... "
-            } else if smoothPosition.y >= 0.45 && smoothPosition.y < 0.55 {
+            } else if smoothPosition.y >= 0.5 - CENTER_RADIUS && smoothPosition.y < 0.5 + CENTER_RADIUS {
                 textToSpeakY = " "
             } else {
                 textToSpeakY = "выше, ... "
             }
             
             if textToSpeakX == " " && textToSpeakY == " " {
-                textToSpeak = "Предмет в центре"
+                if mode == 0 {
+                    textToSpeak = "Предмет в центре ... "
+                } else {
+                    textToSpeak = "Текст в центре ... "
+                }
             } else {
                 textToSpeak = textToSpeakX + textToSpeakY
             }
         }
     }
     
-    // TODO filter false positive predictions on the edge of screen
+    // TODO redo this, + add filter false positive predictions on the edge of screen
     private func filterFalsePositives(_ predictions: [VNRecognizedObjectObservation]) -> [VNRecognizedObjectObservation] {
         var filteredPredictions = [VNRecognizedObjectObservation]()
         for i in 0..<predictions.count {
-            if predictions[i].boundingBox.width > 0.8 || predictions[i].boundingBox.height > 0.8 {
+            if predictions[i].boundingBox.width > 0.9 || predictions[i].boundingBox.height > 0.9 {
                 continue
             } else {
                 filteredPredictions.append(predictions[i])
@@ -124,7 +169,7 @@ class SearchItemTask {
         }
         return filteredPredictions
     }
-    
+        
     private func filterNearestToScreenCenter(_ predictions: [VNRecognizedObjectObservation]) -> VNRecognizedObjectObservation {
         var minDistance = distancePredictionToPoint(prediction: predictions[0], point: SCREEN_CENTER)
         var nearestToScreenCenter = predictions[0]
@@ -139,9 +184,35 @@ class SearchItemTask {
         return nearestToScreenCenter
     }
     
+    private func filterNearestToScreenCenter(_ predictions: [VNRecognizedTextObservation]) -> VNRecognizedTextObservation {
+        var minDistance:Double = 1.0
+        var nearestToScreenCenter = predictions[0]
+        if predictions.count > 1 {
+            for i in 1..<predictions.count {
+                let center = boundingBoxCenter(predictions[i])
+                if minDistance > distancePointToPoint(pointA: center, pointB: SCREEN_CENTER) {
+                    minDistance = distancePointToPoint(pointA: center, pointB: SCREEN_CENTER)
+                    nearestToScreenCenter = predictions[i]
+                }
+            }
+        }
+        return nearestToScreenCenter
+    }
+    
     private func boundingBoxCenter(_ prediction: VNRecognizedObjectObservation) -> Point {
         let rect = prediction.boundingBox
         let boundingBoxCenter = Point(x: Double(rect.midX), y: Double(rect.midY))
+        return boundingBoxCenter
+    }
+    
+    private func boundingBoxCenter(_ prediction: VNRecognizedTextObservation) -> Point {
+        var boundingBoxCenter = Point(x: -1.0, y: -1.0)
+        guard let topCandidate = prediction.topCandidates(1).first else { return boundingBoxCenter}
+        if let box = try? topCandidate.boundingBox(for: topCandidate.string.range(of: topCandidate.string)!) {
+            let topLeft = Point(x: Double(box.topLeft.x), y: Double(box.topLeft.y))
+            let bottomRight = Point(x: Double(box.bottomRight.x), y: Double(box.bottomRight.y))
+            boundingBoxCenter = (topLeft + bottomRight) / 2
+        }
         return boundingBoxCenter
     }
     
@@ -156,7 +227,7 @@ class SearchItemTask {
         return distance
     }
     
-    let modelClassesCustom = [
+    static let modelClassesCustom = [
         "ключи": "Keys", "ключ": "Keys", "включи": "Keys",
         "очки": "Glasses",
         "шапка": "Knitted hat",
@@ -174,7 +245,7 @@ class SearchItemTask {
         "туалетная бумага": "Toilet paper"
     ]
      
-    let modelClassesCOCO = [
+    static let modelClassesCOCO = [
         "человек": "person",
         "велосипед": "bicycle",
         "машина": "car", "автомобиль": "car",
